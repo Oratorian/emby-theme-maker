@@ -317,8 +317,14 @@ namespace EmbyThemeMaker.Theme
                 errTask.Wait(2000);
                 outTask.Wait(2000);
 
-                var lines = errBuf.ToString().TrimEnd().Split('\n');
-                stderrTail = string.Join(" | ", lines.Reverse().Take(3).Reverse().Select(s => s.TrimEnd('\r')));
+                // Last 3 non-empty stderr lines (ffmpeg's error is usually at the tail).
+                var lines = errBuf.ToString()
+                    .Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                    .Select(s => s.TrimEnd('\r'))
+                    .Where(s => s.Length > 0)
+                    .ToList();
+                var tailStart = Math.Max(0, lines.Count - 3);
+                stderrTail = string.Join(" | ", lines.GetRange(tailStart, lines.Count - tailStart));
                 int code;
                 try { code = proc.ExitCode; } catch { code = -1; }
                 return code;
