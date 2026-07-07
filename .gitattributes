@@ -1,0 +1,5 @@
+# Normalize line endings: LF in the repo for text/source, native on checkout.
+* text=auto eol=lf
+
+# Treat the license text as-is.
+LICENSE text eol=lf

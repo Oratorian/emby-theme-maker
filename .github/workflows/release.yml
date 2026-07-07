@@ -1,0 +1,99 @@
+name: Release
+
+# Build the plugin DLL on a version tag, publish a GitHub Release with the DLL
+# attached, and generate a signed build-provenance attestation for the artifact.
+#
+# Tag format: v<semver>, e.g. v1.2.3 or v1.2.3-beta.1
+#   - Version    (informational)   = the semver, suffix included  -> 1.2.3-beta.1
+#   - AssemblyVer/FileVer (numeric) = the numeric core only        -> 1.2.3
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g. 1.2.3). Manual runs only.'
+        required: true
+        default: '0.0.0'
+
+permissions:
+  contents: write        # create the release + upload the asset
+  id-token: write        # OIDC token used to sign the attestation
+  attestations: write    # write the build-provenance attestation
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Derive version from tag
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW="${{ github.event.inputs.version }}"
+          else
+            RAW="${GITHUB_REF_NAME}"      # e.g. v1.2.3-beta.1
+          fi
+          # full semver (strip a leading v) for informational Version
+          FULL="${RAW#v}"
+          # numeric core only (drop any -prerelease/+build suffix) for AssemblyVersion/FileVersion
+          NUM="${FULL%%-*}"; NUM="${NUM%%+*}"
+          echo "full=$FULL" >> "$GITHUB_OUTPUT"
+          echo "numeric=$NUM" >> "$GITHUB_OUTPUT"
+          echo "Building version: full=$FULL numeric=$NUM"
+
+      - name: Restore
+        run: dotnet restore EmbyThemeMaker/EmbyThemeMaker.csproj
+
+      - name: Publish DLL
+        run: >
+          dotnet publish EmbyThemeMaker/EmbyThemeMaker.csproj
+          -c Release
+          --no-restore
+          -o out
+          -p:Version=${{ steps.ver.outputs.numeric }}
+          -p:InformationalVersion=${{ steps.ver.outputs.full }}
+
+      - name: Verify single self-contained DLL
+        shell: bash
+        run: |
+          ls -l out
+          test -f out/EmbyThemeMaker.dll || { echo "DLL missing"; exit 1; }
+          # Host assemblies must NOT be bundled.
+          if ls out/MediaBrowser.*.dll >/dev/null 2>&1; then
+            echo "ERROR: MediaBrowser.* assemblies were bundled"; exit 1;
+          fi
+
+      # Attestation + release only make sense for a real tag push. A manual
+      # workflow_dispatch just builds and verifies the DLL.
+      - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: out/EmbyThemeMaker.dll
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Theme Maker ${{ steps.ver.outputs.full }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: out/EmbyThemeMaker.dll
+
+      - name: Upload DLL artifact (manual runs)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: EmbyThemeMaker
+          path: out/EmbyThemeMaker.dll

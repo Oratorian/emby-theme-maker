@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <RootNamespace>EmbyThemeMaker</RootNamespace>
+    <AssemblyName>EmbyThemeMaker</AssemblyName>
+    <!-- Emby identifies the plugin by Plugin.Id (see Plugin.cs), not by an assembly GUID. -->
+    <!-- Version defaults to 1.0.0 for local builds; CI overrides with -p:Version=<git tag>. -->
+    <Version Condition="'$(Version)' == ''">1.0.0</Version>
+    <AssemblyVersion>$(Version)</AssemblyVersion>
+    <FileVersion>$(Version)</FileVersion>
+    <LangVersion>latest</LangVersion>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <DebugType>portable</DebugType>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+
+  <!--
+    Settings UI is code-driven (BasePluginSimpleUI + EditableOptionsBase), so there are no
+    embedded HTML/JS config pages. See Config/ThemeMakerOptions.cs.
+  -->
+
+  <ItemGroup>
+    <!--
+      Emby server core meta-package (ABI-compatible with Emby Server 4.9.x). Provided by the host
+      at runtime, so ExcludeAssets=runtime keeps MediaBrowser.* out of the plugins folder.
+    -->
+    <PackageReference Include="mediabrowser.server.core" Version="4.9.1.90">
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
+
+    <!--
+      Compile-time only (Emby's host provides it at runtime). Needed for some Span/ReadOnlySpan
+      overloads in the Emby API surface. ExcludeAssets=runtime keeps it out of publish so we ship
+      a single self-contained DLL with no bundled dependencies.
+    -->
+    <PackageReference Include="System.Memory" Version="4.6.3">
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+</Project>
