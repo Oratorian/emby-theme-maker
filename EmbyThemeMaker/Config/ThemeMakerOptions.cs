@@ -39,8 +39,14 @@ namespace EmbyThemeMaker.Config
 
         public CaptionItem ScopeCaption { get; set; } = new CaptionItem("Scope");
 
+        [DisplayName("Include movies")]
+        [Description("Also generate themes for movies. Emby only auto-creates intro markers for episodes, so " +
+                     "a movie is skipped unless it has IntroStart/IntroEnd chapter markers (e.g. added manually " +
+                     "via the Chapter Editor). Series are always processed. Default: off (series only).")]
+        public bool IncludeMovies { get; set; } = false;
+
         [DisplayName("Only under this folder")]
-        [Description("If set, only process series whose folder is under this local path. Leave empty to process every series.")]
+        [Description("If set, only process items whose folder is under this local path. Leave empty to process everything.")]
         [EditFolderPicker]
         public string OnlyUnderPath { get; set; } = string.Empty;
 

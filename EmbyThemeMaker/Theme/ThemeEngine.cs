@@ -5,6 +5,7 @@ using System.Linq;
 using System.Threading;
 using EmbyThemeMaker.Config;
 using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
@@ -68,12 +69,13 @@ namespace EmbyThemeMaker.Theme
             _logger.Info("[ThemeMaker] output: video={0}/{1}, audio={2}",
                 cfg.OutDirName, cfg.OutName, cfg.AudioOutName);
 
-            var series = GetSeries(cfg);
-            _logger.Info("[ThemeMaker] {0} series to consider", series.Count);
+            var units = GetWorkUnits(cfg);
+            _logger.Info("[ThemeMaker] {0} item(s) to consider ({1})", units.Count,
+                cfg.IncludeMovies ? "series + movies" : "series only");
 
-            if (series.Count == 0)
+            if (units.Count == 0)
             {
-                _logger.Info("[ThemeMaker] nothing to do (no series matched). Run finished.");
+                _logger.Info("[ThemeMaker] nothing to do (nothing matched). Run finished.");
                 return results;
             }
 
@@ -84,16 +86,16 @@ namespace EmbyThemeMaker.Theme
             int done = 0;
             bool anyCreated = false;
 
-            foreach (var s in series)
+            foreach (var u in units)
             {
                 ct.ThrowIfCancellationRequested();
                 gate.Wait(ct);
-                var captured = s;
+                var captured = u;
                 tasks.Add(System.Threading.Tasks.Task.Run(() =>
                 {
                     try
                     {
-                        var r = ProcessSeries(captured, cfg, preview, ct);
+                        var r = ProcessUnit(captured, cfg, preview, ct);
                         lock (resultsLock)
                         {
                             results.AddRange(r);
@@ -118,7 +120,7 @@ namespace EmbyThemeMaker.Theme
                     {
                         gate.Release();
                         var d = Interlocked.Increment(ref done);
-                        progress?.Report(90.0 * d / series.Count);
+                        progress?.Report(90.0 * d / units.Count);
                     }
                 }, ct));
             }
@@ -152,42 +154,54 @@ namespace EmbyThemeMaker.Theme
         }
 
         // ------------------------------------------------------------------ #
-        // Series enumeration
+        // Enumeration: build the list of work units (series, plus movies if enabled)
         // ------------------------------------------------------------------ #
-        private List<Series> GetSeries(ThemeMakerOptions cfg)
+        private List<WorkUnit> GetWorkUnits(ThemeMakerOptions cfg)
         {
+            var types = cfg.IncludeMovies ? new[] { "Series", "Movie" } : new[] { "Series" };
+
             BaseItem[] items;
             try
             {
                 items = _libraryManager.GetItemList(new InternalItemsQuery
                 {
-                    IncludeItemTypes = new[] { "Series" },
+                    IncludeItemTypes = types,
                     Recursive = true,
                 });
             }
             catch (Exception ex)
             {
-                _logger.Error("[ThemeMaker] failed to query series: {0}", ex.Message);
-                return new List<Series>();
+                _logger.Error("[ThemeMaker] failed to query items: {0}", ex.Message);
+                return new List<WorkUnit>();
             }
 
-            var list = new List<Series>();
+            var list = new List<WorkUnit>();
             foreach (var it in items ?? Array.Empty<BaseItem>())
             {
-                if (!(it is Series s) || string.IsNullOrEmpty(s.Path))
+                if (string.IsNullOrEmpty(it.Path))
                 {
                     continue;
                 }
 
-                if (!string.IsNullOrWhiteSpace(cfg.OnlyUnderPath) && !IsUnder(s.Path, cfg.OnlyUnderPath))
+                if (!string.IsNullOrWhiteSpace(cfg.OnlyUnderPath) && !IsUnder(it.Path, cfg.OnlyUnderPath))
                 {
                     continue;
                 }
 
-                list.Add(s);
+                // A series fans out to its episodes; a movie is its own single source. The output
+                // dir is the item's own folder in both cases (series root / movie folder).
+                if (it is Series series)
+                {
+                    list.Add(new WorkUnit(series.Name ?? "?", series.Path, isMovie: false, GetEpisodes(series)));
+                }
+                else if (it is Movie movie)
+                {
+                    list.Add(new WorkUnit(movie.Name ?? "?", MovieDir(movie), isMovie: true,
+                                          new List<BaseItem> { movie }));
+                }
             }
 
-            list = list.OrderBy(s => s.Name, StringComparer.OrdinalIgnoreCase).ToList();
+            list = list.OrderBy(u => u.Name, StringComparer.OrdinalIgnoreCase).ToList();
             if (cfg.Limit > 0 && list.Count > cfg.Limit)
             {
                 list = list.Take(cfg.Limit).ToList();
@@ -196,9 +210,14 @@ namespace EmbyThemeMaker.Theme
             return list;
         }
 
-        private List<Episode> GetEpisodes(Series series)
+        // Output folder for a movie: its own containing directory (standard Emby one-folder-per-movie
+        // layout). backdrops/theme.mp4 and theme.mp3 land there, mirroring the series convention.
+        private static string MovieDir(Movie movie)
+            => Path.GetDirectoryName(movie.Path) ?? movie.Path;
+
+        private List<BaseItem> GetEpisodes(Series series)
         {
-            var eps = new List<Episode>();
+            var eps = new List<BaseItem>();
             try
             {
                 foreach (var child in series.GetRecursiveChildren())
@@ -218,21 +237,24 @@ namespace EmbyThemeMaker.Theme
         }
 
         // ------------------------------------------------------------------ #
-        // Per-series processing
+        // Per-unit processing (series or movie)
         // ------------------------------------------------------------------ #
-        private List<ThemeResult> ProcessSeries(Series series, ThemeMakerOptions cfg, bool preview,
-                                                CancellationToken ct)
+        private List<ThemeResult> ProcessUnit(WorkUnit unit, ThemeMakerOptions cfg, bool preview,
+                                              CancellationToken ct)
         {
-            var name = series.Name ?? "?";
-            var seriesDir = series.Path;
-            var targets = BuildTargets(seriesDir, cfg);
+            var name = unit.Name;
+            var targets = BuildTargets(unit.OutDir, cfg);
 
-            var episodes = GetEpisodes(series);
-            var (cand, reason) = ChooseSource(episodes, cfg, ct);
+            var (cand, reason) = ChooseSource(unit.Sources, cfg, ct);
 
             if (cand == null)
             {
-                _logger.Info("[ThemeMaker] '{0}': no usable source ({1}) — {2} episode(s) scanned", name, reason, episodes.Count);
+                _logger.Info("[ThemeMaker] '{0}': no usable source ({1}) — {2} source(s) scanned", name, reason, unit.Sources.Count);
+            }
+            else if (unit.IsMovie)
+            {
+                _logger.Info("[ThemeMaker] '{0}' (movie): source intro {1:0.0}-{2:0.0}s ({3:0.0}s, {4}) from {5}",
+                    name, cand.Start, cand.End, cand.Duration, reason, cand.LocalPath);
             }
             else
             {
@@ -328,16 +350,16 @@ namespace EmbyThemeMaker.Theme
         // ------------------------------------------------------------------ #
         // Marker reading + candidate selection (ported from Python)
         // ------------------------------------------------------------------ #
-        private (double Start, double End)? FindIntro(Episode ep, CancellationToken ct)
+        private (double Start, double End)? FindIntro(BaseItem item, CancellationToken ct)
         {
             List<ChapterInfo> chapters;
             try
             {
-                chapters = _itemRepository.GetChapters(ep, ct);
+                chapters = _itemRepository.GetChapters(item, ct);
             }
             catch (Exception ex)
             {
-                _logger.Debug("[ThemeMaker] GetChapters failed for '{0}': {1}", ep.Path, ex.Message);
+                _logger.Debug("[ThemeMaker] GetChapters failed for '{0}': {1}", item.Path, ex.Message);
                 return null;
             }
 
@@ -362,16 +384,16 @@ namespace EmbyThemeMaker.Theme
             return (start.Value, end.Value);
         }
 
-        private (Candidate, string) ChooseSource(List<Episode> episodes, ThemeMakerOptions cfg,
+        private (Candidate, string) ChooseSource(List<BaseItem> sources, ThemeMakerOptions cfg,
                                                  CancellationToken ct)
         {
             var candidates = new List<Candidate>();
             bool sawMarker = false;
 
-            foreach (var ep in episodes)
+            foreach (var item in sources)
             {
                 ct.ThrowIfCancellationRequested();
-                var intro = FindIntro(ep, ct);
+                var intro = FindIntro(item, ct);
                 if (intro == null)
                 {
                     continue;
@@ -385,26 +407,27 @@ namespace EmbyThemeMaker.Theme
                     continue;
                 }
 
-                var local = ep.Path;
+                var local = item.Path;
                 if (string.IsNullOrEmpty(local) || !File.Exists(local))
                 {
                     continue;
                 }
 
-                candidates.Add(new Candidate { Episode = ep, LocalPath = local, Start = start, End = end });
+                candidates.Add(new Candidate { Item = item, LocalPath = local, Start = start, End = end });
             }
 
             if (candidates.Count == 0)
             {
-                return (null, sawMarker ? "markers present but no usable/in-range episode file" : "no intro markers");
+                return (null, sawMarker ? "markers present but no usable/in-range source file" : "no intro markers");
             }
 
             if (cfg.Prefer == SourcePref.First)
             {
                 // Push specials/extras (season 0 or missing) to the back so real S01E01 wins.
+                // For a movie there is only one candidate, so ordering is a no-op.
                 int FirstSeason(Candidate c)
                 {
-                    var s = c.Episode.ParentIndexNumber;
+                    var s = c.Item.ParentIndexNumber;
                     return (s.HasValue && s.Value > 0) ? s.Value : 9999;
                 }
 
@@ -442,7 +465,7 @@ namespace EmbyThemeMaker.Theme
         // ------------------------------------------------------------------ #
         // Targets + existing-theme detection (ported from Python)
         // ------------------------------------------------------------------ #
-        private static List<Target> BuildTargets(string seriesDir, ThemeMakerOptions cfg)
+        private static List<Target> BuildTargets(string itemDir, ThemeMakerOptions cfg)
         {
             var targets = new List<Target>();
             if (cfg.Mode == ThemeMode.Video || cfg.Mode == ThemeMode.Both)
@@ -450,7 +473,7 @@ namespace EmbyThemeMaker.Theme
                 targets.Add(new Target
                 {
                     Kind = TargetKind.Video,
-                    OutDir = Path.Combine(seriesDir, cfg.OutDirName),
+                    OutDir = Path.Combine(itemDir, cfg.OutDirName),
                     OutName = cfg.OutName,
                 });
             }
@@ -460,7 +483,7 @@ namespace EmbyThemeMaker.Theme
                 targets.Add(new Target
                 {
                     Kind = TargetKind.Audio,
-                    OutDir = seriesDir,
+                    OutDir = itemDir,
                     OutName = cfg.AudioOutName,
                 });
             }
