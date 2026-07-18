@@ -213,6 +213,12 @@ namespace EmbyThemeMaker.Config
                 }
             }
 
+            if (!string.IsNullOrWhiteSpace(OnlyUnderPath) && !Directory.Exists(OnlyUnderPath))
+            {
+                context.AddValidationError(nameof(OnlyUnderPath),
+                    "This folder does not exist (or isn't reachable by the server) — every item would be filtered out.");
+            }
+
             if (!string.IsNullOrWhiteSpace(MaxRate) && !RateRe.IsMatch(MaxRate.Trim()))
             {
                 context.AddValidationError(nameof(MaxRate),

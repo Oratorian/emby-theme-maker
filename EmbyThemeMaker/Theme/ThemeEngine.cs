@@ -76,7 +76,16 @@ namespace EmbyThemeMaker.Theme
 
             if (units.Count == 0)
             {
-                _logger.Info("[ThemeMaker] nothing to do (nothing matched). Run finished.");
+                if (!string.IsNullOrWhiteSpace(cfg.OnlyUnderPath))
+                {
+                    _logger.Info("[ThemeMaker] nothing to do — no items under '{0}' (check the \"Only under this folder\" setting). Run finished.",
+                        cfg.OnlyUnderPath);
+                }
+                else
+                {
+                    _logger.Info("[ThemeMaker] nothing to do (nothing matched). Run finished.");
+                }
+
                 return results;
             }
 
@@ -191,6 +200,9 @@ namespace EmbyThemeMaker.Theme
                             }
                         }
                     });
+                    // Block on the scan intentionally: Run is a synchronous method invoked from the
+                    // task's Task.Run, so tying up this one pool thread until the scan finishes is
+                    // fine (and there is no captured SynchronizationContext here, so no deadlock).
                     _libraryManager.ValidateMediaLibrary(scanProgress, ct).GetAwaiter().GetResult();
                 }
                 catch (OperationCanceledException)
@@ -453,25 +465,71 @@ namespace EmbyThemeMaker.Theme
                 return null;
             }
 
-            double? start = null, end = null;
+            // Collect and sort marker positions rather than trusting repository order: pick the
+            // earliest IntroStart, then the earliest IntroEnd strictly after it. This survives
+            // chapters returned out of order or a stray IntroEnd sitting before the real IntroStart.
+            var starts = new List<long>();
+            var ends = new List<long>();
             foreach (var ch in chapters ?? new List<ChapterInfo>())
             {
-                if (ch.MarkerType == MarkerType.IntroStart && start == null)
+                if (ch.MarkerType == MarkerType.IntroStart)
                 {
-                    start = ch.StartPositionTicks / (double)TicksPerSecond;
+                    starts.Add(ch.StartPositionTicks);
                 }
-                else if (ch.MarkerType == MarkerType.IntroEnd && end == null)
+                else if (ch.MarkerType == MarkerType.IntroEnd)
                 {
-                    end = ch.StartPositionTicks / (double)TicksPerSecond;
+                    ends.Add(ch.StartPositionTicks);
                 }
             }
 
-            if (start == null || end == null || end <= start)
+            if (starts.Count == 0 || ends.Count == 0)
             {
                 return null;
             }
 
-            return (start.Value, end.Value);
+            long startTicks = starts.Min();
+            long? endTicks = ends.Where(e => e > startTicks).Cast<long?>().Min();
+            if (endTicks == null)
+            {
+                return null;
+            }
+
+            return (startTicks / (double)TicksPerSecond, endTicks.Value / (double)TicksPerSecond);
+        }
+
+        // Resolve an item's path to an actual playable file. Usually the path IS the file. For a
+        // folder-stacked / disc-image movie (DVD/BDMV or a stacked folder) Emby may set Path to a
+        // directory; in that case pick the largest video file under it (the main feature) so a
+        // stacked movie with valid markers isn't silently skipped. Returns null if nothing usable.
+        private static string ResolveMediaFile(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+            {
+                return null;
+            }
+
+            if (File.Exists(path))
+            {
+                return path;
+            }
+
+            if (!Directory.Exists(path))
+            {
+                return null;
+            }
+
+            try
+            {
+                return Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories)
+                    .Where(f => ThemeExts.Contains(Path.GetExtension(f), StringComparer.OrdinalIgnoreCase)
+                                || string.Equals(Path.GetExtension(f), ".ts", StringComparison.OrdinalIgnoreCase))
+                    .OrderByDescending(f => { try { return new FileInfo(f).Length; } catch { return 0L; } })
+                    .FirstOrDefault();
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private (Candidate, string) ChooseSource(List<BaseItem> sources, ThemeMakerOptions cfg,
@@ -499,8 +557,8 @@ namespace EmbyThemeMaker.Theme
                     continue;
                 }
 
-                var local = item.Path;
-                if (string.IsNullOrEmpty(local) || !File.Exists(local))
+                var local = ResolveMediaFile(item.Path);
+                if (local == null)
                 {
                     continue;
                 }

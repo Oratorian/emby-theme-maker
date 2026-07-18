@@ -82,9 +82,10 @@ namespace EmbyThemeMaker.Theme
 
             int rc;
             string stderrTail;
+            bool timedOut;
             try
             {
-                rc = RunFfmpeg(ffmpeg, args, out stderrTail, ct);
+                rc = RunFfmpeg(ffmpeg, args, out stderrTail, out timedOut, ct);
             }
             catch (OperationCanceledException)
             {
@@ -95,6 +96,12 @@ namespace EmbyThemeMaker.Theme
             {
                 SafeDelete(tmp);
                 return "ffmpeg spawn failed: " + ex.Message;
+            }
+
+            if (timedOut)
+            {
+                SafeDelete(tmp);
+                return "ffmpeg killed: exceeded " + MaxRuntimeMinutes + " min runtime cap (source may be unreadable)";
             }
 
             if (rc != 0)
@@ -182,6 +189,13 @@ namespace EmbyThemeMaker.Theme
                 {
                     amap = "0:a:" + idx.Value + "?";
                 }
+                else
+                {
+                    // No stream tagged with the requested language — fall back to the first, but say
+                    // so, since a wrong tag (e.g. "english"/"jp" instead of "eng"/"jpn") is silent otherwise.
+                    _logger.Info("[ThemeMaker] no audio stream tagged '{0}' in {1}; using the first stream",
+                        cfg.AudioLang, src);
+                }
             }
 
             return amap;
@@ -267,8 +281,12 @@ namespace EmbyThemeMaker.Theme
         // ------------------------------------------------------------------ #
         // Process execution
         // ------------------------------------------------------------------ #
-        private int RunFfmpeg(string ffmpeg, List<string> args, out string stderrTail, CancellationToken ct)
+        private const int MaxRuntimeMinutes = 30;
+
+        private int RunFfmpeg(string ffmpeg, List<string> args, out string stderrTail, out bool timedOut,
+                              CancellationToken ct)
         {
+            timedOut = false;
             var psi = new ProcessStartInfo
             {
                 FileName = ffmpeg,
@@ -298,7 +316,7 @@ namespace EmbyThemeMaker.Theme
                 // Safety net: theme clips are seconds long, so an encode running for many minutes
                 // means ffmpeg has wedged. Kill it so a stuck encode can't hang the scheduled task
                 // forever even if the task is never cancelled. Uses monotonic TickCount.
-                const int maxRuntimeMs = 30 * 60 * 1000; // 30 minutes
+                const int maxRuntimeMs = MaxRuntimeMinutes * 60 * 1000;
                 int startTick = Environment.TickCount;
 
                 while (!proc.WaitForExit(250))
@@ -306,13 +324,19 @@ namespace EmbyThemeMaker.Theme
                     if (ct.IsCancellationRequested)
                     {
                         try { proc.Kill(); } catch { /* best effort */ }
+                        try { proc.WaitForExit(); } catch { /* already gone */ }
+                        // Let the readers settle against the now-closed pipes before the process is
+                        // disposed, so their in-flight reads don't fault with ObjectDisposedException.
+                        try { errTask.Wait(1000); } catch { /* best effort */ }
+                        try { outTask.Wait(1000); } catch { /* best effort */ }
                         throw new OperationCanceledException(ct);
                     }
 
                     if (unchecked(Environment.TickCount - startTick) > maxRuntimeMs)
                     {
                         try { proc.Kill(); } catch { /* best effort */ }
-                        errBuf.AppendLine("(killed: exceeded " + (maxRuntimeMs / 60000) + " min runtime cap)");
+                        timedOut = true;
+                        errBuf.AppendLine("(killed: exceeded " + MaxRuntimeMinutes + " min runtime cap)");
                         break;
                     }
                 }
@@ -320,8 +344,10 @@ namespace EmbyThemeMaker.Theme
                 // Ensure the process is fully settled (esp. after a Kill) before reading ExitCode.
                 try { proc.WaitForExit(); } catch { /* already exited */ }
 
-                errTask.Wait(2000);
-                outTask.Wait(2000);
+                // The pipes are closed once the process has exited, so the readers complete promptly;
+                // wait unbounded before touching errBuf so the read is not racing the drain thread.
+                try { errTask.Wait(); } catch { /* reader faulted; use whatever was buffered */ }
+                try { outTask.Wait(); } catch { /* stdout is unused */ }
 
                 // Last 3 non-empty stderr lines (ffmpeg's error is usually at the tail).
                 var lines = errBuf.ToString()
