@@ -68,11 +68,22 @@ namespace EmbyThemeMaker.Tasks
 
         private void LogSummary(List<ThemeResult> results)
         {
-            // Per-line detail for anything noteworthy (skip the noisy "skipped: exists" rows).
+            // Only log a per-line row at Info for the outcomes that actually matter for the mode:
+            // for Generate that's what was written (Created) or failed (Error); for Preview that's
+            // what would be written (WouldCreate) or failed. Everything else (Skipped/NoSource, i.e.
+            // the bulk on a large library) rolls into the summary counts only. Full per-item detail
+            // is available at Debug from the engine. This keeps a big-library run to a few lines.
+            var interesting = Preview
+                ? new[] { ResultStatus.WouldCreate, ResultStatus.Error }
+                : new[] { ResultStatus.Created, ResultStatus.Error };
+
             foreach (var r in results)
             {
-                if (r.Status == ResultStatus.Skipped)
+                if (Array.IndexOf(interesting, r.Status) < 0)
                 {
+                    // Not a headline outcome — keep it out of the Info log, but leave a Debug trail.
+                    var kd = r.Kind.HasValue ? " [" + r.Kind.Value.ToString().ToLowerInvariant() + "]" : "";
+                    Logger.Debug("[ThemeMaker]   {0} {1}{2}: {3}", r.Status, r.SeriesName, kd, r.Detail);
                     continue;
                 }
 

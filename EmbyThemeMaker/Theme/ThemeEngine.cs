@@ -290,18 +290,20 @@ namespace EmbyThemeMaker.Theme
 
             var (cand, reason) = ChooseSource(unit.Sources, cfg, ct);
 
+            // Per-item source selection is Debug: on a large library most items have no markers,
+            // so logging every one at Info floods the log. The run summary reports the counts.
             if (cand == null)
             {
-                _logger.Info("[ThemeMaker] '{0}': no usable source ({1}) — {2} source(s) scanned", name, reason, unit.Sources.Count);
+                _logger.Debug("[ThemeMaker] '{0}': no usable source ({1}) — {2} source(s) scanned", name, reason, unit.Sources.Count);
             }
             else if (unit.IsMovie)
             {
-                _logger.Info("[ThemeMaker] '{0}' (movie): source intro {1:0.0}-{2:0.0}s ({3:0.0}s, {4}) from {5}",
+                _logger.Debug("[ThemeMaker] '{0}' (movie): source intro {1:0.0}-{2:0.0}s ({3:0.0}s, {4}) from {5}",
                     name, cand.Start, cand.End, cand.Duration, reason, cand.LocalPath);
             }
             else
             {
-                _logger.Info("[ThemeMaker] '{0}': source S{1}E{2} intro {3:0.0}-{4:0.0}s ({5:0.0}s, {6}) from {7}",
+                _logger.Debug("[ThemeMaker] '{0}': source S{1}E{2} intro {3:0.0}-{4:0.0}s ({5:0.0}s, {6}) from {7}",
                     name, cand.Season, cand.Number, cand.Start, cand.End, cand.Duration, reason, cand.LocalPath);
             }
 
@@ -352,7 +354,7 @@ namespace EmbyThemeMaker.Theme
                 return ThemeResult.Make(name, ResultStatus.Error, "mkdir failed: " + ex.Message, t.Kind);
             }
 
-            _logger.Info("[ThemeMaker] '{0}' [{1}]: encoding {2:0.0}s -> {3}", name, t.Kind, dur, t.OutPath);
+            _logger.Debug("[ThemeMaker] '{0}' [{1}]: encoding {2:0.0}s -> {3}", name, t.Kind, dur, t.OutPath);
             var err = _ffmpeg.Encode(t, cand.LocalPath, start, dur, cfg, ct);
             if (err != null)
             {
