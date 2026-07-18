@@ -53,6 +53,7 @@ namespace EmbyThemeMaker.Theme
                                      CancellationToken ct)
         {
             var results = new List<ThemeResult>();
+            progress?.Report(0);
 
             var maxRate = string.IsNullOrWhiteSpace(cfg.MaxRate) ? "uncapped" : cfg.MaxRate;
             var audioLang = string.IsNullOrWhiteSpace(cfg.AudioLang) ? "any" : cfg.AudioLang;
@@ -83,16 +84,40 @@ namespace EmbyThemeMaker.Theme
             var gate = new SemaphoreSlim(jobs);
             var tasks = new List<System.Threading.Tasks.Task>();
             var resultsLock = new object();
-            int done = 0;
             bool anyCreated = false;
+
+            // Progress: encoding owns 0..90, the trailing library scan owns 90..100. Each unit's
+            // targets are credited half on start and half on finish, so the bar moves even for a
+            // single unit (0 -> 45 -> 90) instead of only jumping when a unit completes. A high-water
+            // mark keeps it strictly non-decreasing despite parallel/out-of-order reports.
+            int totalTargets = units.Sum(_ => TargetCountFor(cfg));
+            double progressUnits = 0.0;
+            double lastReported = 0.0;
+            var progressLock = new object();
+
+            void ReportEncode(double deltaTargets)
+            {
+                lock (progressLock)
+                {
+                    progressUnits += deltaTargets;
+                    var pct = 90.0 * progressUnits / Math.Max(1, totalTargets);
+                    if (pct > lastReported)
+                    {
+                        lastReported = pct;
+                        progress?.Report(pct);
+                    }
+                }
+            }
 
             foreach (var u in units)
             {
                 ct.ThrowIfCancellationRequested();
                 gate.Wait(ct);
                 var captured = u;
+                var unitTargets = TargetCountFor(cfg);
                 tasks.Add(System.Threading.Tasks.Task.Run(() =>
                 {
+                    ReportEncode(0.5 * unitTargets); // this unit's targets started
                     try
                     {
                         var r = ProcessUnit(captured, cfg, preview, ct);
@@ -119,8 +144,7 @@ namespace EmbyThemeMaker.Theme
                     finally
                     {
                         gate.Release();
-                        var d = Interlocked.Increment(ref done);
-                        progress?.Report(90.0 * d / units.Count);
+                        ReportEncode(0.5 * unitTargets); // this unit's targets finished
                     }
                 }, ct));
             }
@@ -135,13 +159,32 @@ namespace EmbyThemeMaker.Theme
             }
 
             // A single library scan registers everything just written (theme music only
-            // registers on a full scan).
+            // registers on a full scan). The scan owns the 90..100 band: its own progress is
+            // forwarded (mapped 0..100 -> 90..100) so the bar keeps moving during the scan tail
+            // instead of freezing at 90. The scan is awaited — it returns a Task; discarding it
+            // would let Report(100)/LogSummary fire while the scan is still running.
             if (!preview && cfg.RefreshAfter && anyCreated)
             {
                 _logger.Info("[ThemeMaker] requesting Emby library scan so new theme files are detected");
                 try
                 {
-                    _libraryManager.ValidateMediaLibrary(new Progress<double>(), ct);
+                    var scanProgress = new Progress<double>(childPct =>
+                    {
+                        var pct = 90.0 + 10.0 * (Math.Max(0.0, Math.Min(100.0, childPct)) / 100.0);
+                        lock (progressLock)
+                        {
+                            if (pct > lastReported)
+                            {
+                                lastReported = pct;
+                                progress?.Report(pct);
+                            }
+                        }
+                    });
+                    _libraryManager.ValidateMediaLibrary(scanProgress, ct).GetAwaiter().GetResult();
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -465,6 +508,11 @@ namespace EmbyThemeMaker.Theme
         // ------------------------------------------------------------------ #
         // Targets + existing-theme detection (ported from Python)
         // ------------------------------------------------------------------ #
+        // How many output targets a unit produces (Both = video + audio = 2, otherwise 1). Kept in
+        // step with BuildTargets so progress weighting matches the actual encode count.
+        private static int TargetCountFor(ThemeMakerOptions cfg)
+            => cfg.Mode == ThemeMode.Both ? 2 : 1;
+
         private static List<Target> BuildTargets(string itemDir, ThemeMakerOptions cfg)
         {
             var targets = new List<Target>();
