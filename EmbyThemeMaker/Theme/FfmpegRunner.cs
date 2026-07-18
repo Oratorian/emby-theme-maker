@@ -39,6 +39,12 @@ namespace EmbyThemeMaker.Theme
                 [".wav"] = ("wav", "pcm_s16le"),
             };
 
+        /// <summary>Video output extensions this runner can actually mux (for settings validation).</summary>
+        public static IReadOnlyCollection<string> SupportedVideoExts => (IReadOnlyCollection<string>)FormatByExt.Keys;
+
+        /// <summary>Audio output extensions this runner can actually mux (for settings validation).</summary>
+        public static IReadOnlyCollection<string> SupportedAudioExts => (IReadOnlyCollection<string>)AudioCodecByExt.Keys;
+
         private readonly IFfmpegManager _ffmpegManager;
         private readonly ILogger _logger;
 
@@ -361,10 +367,25 @@ namespace EmbyThemeMaker.Theme
                 using (var proc = new Process { StartInfo = psi })
                 {
                     proc.Start();
-                    var json = proc.StandardOutput.ReadToEnd();
-                    proc.StandardError.ReadToEnd();
-                    proc.WaitForExit(60000);
-                    return FindLangIndex(json, lang);
+
+                    // Drain both pipes on background tasks so ffprobe can never block writing to a
+                    // full stderr buffer while we read stdout (a classic single-threaded-drain
+                    // deadlock). Kill and bail if it overruns the timeout so a wedged ffprobe never
+                    // holds its encode slot forever.
+                    var outTask = System.Threading.Tasks.Task.Run(() => proc.StandardOutput.ReadToEnd());
+                    var errTask = System.Threading.Tasks.Task.Run(() => proc.StandardError.ReadToEnd());
+
+                    if (!proc.WaitForExit(60000))
+                    {
+                        try { proc.Kill(); } catch { /* best effort */ }
+                        try { proc.WaitForExit(); } catch { /* already gone */ }
+                        _logger.Debug("[ThemeMaker] ffprobe audio-lang detect timed out for {0}", path);
+                        return null;
+                    }
+
+                    outTask.Wait(2000);
+                    return FindLangIndex(outTask.Status == System.Threading.Tasks.TaskStatus.RanToCompletion
+                        ? outTask.Result : string.Empty, lang);
                 }
             }
             catch (Exception ex)

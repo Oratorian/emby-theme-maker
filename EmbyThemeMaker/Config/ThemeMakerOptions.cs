@@ -1,7 +1,11 @@
 using System.ComponentModel;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
 using Emby.Web.GenericEdit;
 using Emby.Web.GenericEdit.Elements;
 using Emby.Web.GenericEdit.Validation;
+using EmbyThemeMaker.Theme;
 using MediaBrowser.Model.Attributes;
 
 namespace EmbyThemeMaker.Config
@@ -152,6 +156,9 @@ namespace EmbyThemeMaker.Config
         [Description("Request one Emby library scan at the end so new theme files are registered (a per-item refresh does not pick up theme media).")]
         public bool RefreshAfter { get; set; } = true;
 
+        // A bitrate/rate token ffmpeg accepts: a number with an optional k/M/G suffix (e.g. 192k, 4M, 3500k).
+        private static readonly Regex RateRe = new Regex(@"^\d+(\.\d+)?[kKmMgG]?$", RegexOptions.Compiled);
+
         protected override void Validate(ValidationContext context)
         {
             if (MaxIntro < MinIntro)
@@ -160,14 +167,85 @@ namespace EmbyThemeMaker.Config
                     "Maximum intro length must be greater than or equal to the minimum.");
             }
 
-            if ((Mode == ThemeMode.Video || Mode == ThemeMode.Both) && string.IsNullOrWhiteSpace(OutName))
+            var wantVideo = Mode == ThemeMode.Video || Mode == ThemeMode.Both;
+            var wantAudio = Mode == ThemeMode.Audio || Mode == ThemeMode.Both;
+
+            if (wantVideo)
             {
-                context.AddValidationError(nameof(OutName), "Video filename is required.");
+                if (string.IsNullOrWhiteSpace(OutName))
+                {
+                    context.AddValidationError(nameof(OutName), "Video filename is required.");
+                }
+                else
+                {
+                    ValidateBareFilename(context, nameof(OutName), OutName);
+                    ValidateExt(context, nameof(OutName), OutName,
+                        FfmpegRunner.SupportedVideoExts, "video");
+                }
             }
 
-            if ((Mode == ThemeMode.Audio || Mode == ThemeMode.Both) && string.IsNullOrWhiteSpace(AudioOutName))
+            if (wantAudio)
             {
-                context.AddValidationError(nameof(AudioOutName), "Audio filename is required for audio/both modes.");
+                if (string.IsNullOrWhiteSpace(AudioOutName))
+                {
+                    context.AddValidationError(nameof(AudioOutName), "Audio filename is required for audio/both modes.");
+                }
+                else
+                {
+                    ValidateBareFilename(context, nameof(AudioOutName), AudioOutName);
+                    ValidateExt(context, nameof(AudioOutName), AudioOutName,
+                        FfmpegRunner.SupportedAudioExts, "audio");
+                }
+            }
+
+            // Backdrop subfolder must be a plain relative folder name (no separators / traversal / rooting),
+            // and must be non-empty for video so theme.mp4 lands in backdrops/ and never collides with the
+            // audio target in the item root.
+            if (wantVideo)
+            {
+                if (string.IsNullOrWhiteSpace(OutDirName))
+                {
+                    context.AddValidationError(nameof(OutDirName), "Backdrop subfolder is required for video/both modes.");
+                }
+                else
+                {
+                    ValidateBareFilename(context, nameof(OutDirName), OutDirName);
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(MaxRate) && !RateRe.IsMatch(MaxRate.Trim()))
+            {
+                context.AddValidationError(nameof(MaxRate),
+                    "Peak bitrate must be a number with an optional k/M/G suffix, e.g. 4M or 3500k.");
+            }
+
+            if (!string.IsNullOrWhiteSpace(AudioBitrate) && !RateRe.IsMatch(AudioBitrate.Trim()))
+            {
+                context.AddValidationError(nameof(AudioBitrate),
+                    "Audio bitrate must be a number with an optional k/M/G suffix, e.g. 192k.");
+            }
+        }
+
+        // Reject anything that isn't a bare name: no directory separators, no "..", not rooted. The
+        // temp-write naming and existing-theme scan all assume a plain filename/folder in the item dir.
+        private static void ValidateBareFilename(ValidationContext context, string field, string value)
+        {
+            var v = value.Trim();
+            if (v.IndexOf('/') >= 0 || v.IndexOf('\\') >= 0 || v.Contains("..") || Path.IsPathRooted(v))
+            {
+                context.AddValidationError(field,
+                    "Must be a plain name with no folders, '..', or drive/root — it is created inside each item's own folder.");
+            }
+        }
+
+        private static void ValidateExt(ValidationContext context, string field, string value,
+                                        System.Collections.Generic.IReadOnlyCollection<string> supported, string kind)
+        {
+            var ext = Path.GetExtension(value);
+            if (string.IsNullOrEmpty(ext) || !supported.Contains(ext, System.StringComparer.OrdinalIgnoreCase))
+            {
+                context.AddValidationError(field,
+                    "Unsupported " + kind + " extension — use one of: " + string.Join(", ", supported.OrderBy(e => e)) + ".");
             }
         }
     }

@@ -109,54 +109,65 @@ namespace EmbyThemeMaker.Theme
                 }
             }
 
-            foreach (var u in units)
-            {
-                ct.ThrowIfCancellationRequested();
-                gate.Wait(ct);
-                var captured = u;
-                var unitTargets = TargetCountFor(cfg);
-                tasks.Add(System.Threading.Tasks.Task.Run(() =>
-                {
-                    ReportEncode(0.5 * unitTargets); // this unit's targets started
-                    try
-                    {
-                        var r = ProcessUnit(captured, cfg, preview, ct);
-                        lock (resultsLock)
-                        {
-                            results.AddRange(r);
-                            if (r.Any(x => x.Status == ResultStatus.Created))
-                            {
-                                anyCreated = true;
-                            }
-                        }
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        // swallow; the outer run reports cancellation
-                    }
-                    catch (Exception ex)
-                    {
-                        lock (resultsLock)
-                        {
-                            results.Add(ThemeResult.Make(captured.Name, ResultStatus.Error, "unexpected: " + ex.Message));
-                        }
-                    }
-                    finally
-                    {
-                        gate.Release();
-                        ReportEncode(0.5 * unitTargets); // this unit's targets finished
-                    }
-                }, ct));
-            }
-
+            // Launch loop is wrapped so that, however we leave it (normal completion OR a
+            // cancellation thrown by ThrowIfCancellationRequested/gate.Wait mid-enumeration), every
+            // worker already launched is joined before Run returns. Otherwise a cancel mid-launch
+            // would throw straight out, leaving up-to-`jobs` encode threads orphaned and still
+            // writing/deleting in output dirs when the next run starts. The worker bodies swallow
+            // OCE/Exception, so the post-loop WaitAll never throws from normal cancellation.
             try
             {
-                System.Threading.Tasks.Task.WaitAll(tasks.ToArray(), ct);
+                foreach (var u in units)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    gate.Wait(ct);
+                    var captured = u;
+                    var unitTargets = TargetCountFor(cfg);
+                    tasks.Add(System.Threading.Tasks.Task.Run(() =>
+                    {
+                        ReportEncode(0.5 * unitTargets); // this unit's targets started
+                        try
+                        {
+                            var r = ProcessUnit(captured, cfg, preview, ct);
+                            lock (resultsLock)
+                            {
+                                results.AddRange(r);
+                                if (r.Any(x => x.Status == ResultStatus.Created))
+                                {
+                                    anyCreated = true;
+                                }
+                            }
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // swallow; the outer run reports cancellation
+                        }
+                        catch (Exception ex)
+                        {
+                            lock (resultsLock)
+                            {
+                                results.Add(ThemeResult.Make(captured.Name, ResultStatus.Error, "unexpected: " + ex.Message));
+                            }
+                        }
+                        finally
+                        {
+                            gate.Release();
+                            ReportEncode(0.5 * unitTargets); // this unit's targets finished
+                        }
+                    }, ct));
+                }
             }
-            catch (OperationCanceledException)
+            finally
             {
-                throw;
+                // Join everything already launched. The Release()s in worker finallys must complete
+                // before the semaphore is disposed below, so this join precedes Dispose.
+                try { System.Threading.Tasks.Task.WaitAll(tasks.ToArray()); }
+                catch (AggregateException) { /* worker bodies already handled their own errors */ }
+                gate.Dispose();
             }
+
+            // Surface a cancellation requested during launch/encode now that all workers are joined.
+            ct.ThrowIfCancellationRequested();
 
             // A single library scan registers everything just written (theme music only
             // registers on a full scan). The scan owns the 90..100 band: its own progress is
@@ -244,19 +255,49 @@ namespace EmbyThemeMaker.Theme
                 }
             }
 
-            list = list.OrderBy(u => u.Name, StringComparer.OrdinalIgnoreCase).ToList();
-            if (cfg.Limit > 0 && list.Count > cfg.Limit)
+            // Movie output goes to the movie's own folder. If two units resolve to the SAME output
+            // folder (two loose movie files in one directory, or a movie sitting directly in a
+            // library root shared with other items), they would write the same backdrops/theme.mp4
+            // and clobber each other — and a library-root theme is applied library-wide, not per
+            // movie. Only movies that own their folder are safe, so skip any whose OutDir is shared.
+            var dirCounts = list
+                .GroupBy(u => NormDir(u.OutDir), StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, g => g.Count(), StringComparer.OrdinalIgnoreCase);
+
+            var kept = new List<WorkUnit>();
+            foreach (var u in list)
             {
-                list = list.Take(cfg.Limit).ToList();
+                if (u.IsMovie && dirCounts.TryGetValue(NormDir(u.OutDir), out var n) && n > 1)
+                {
+                    _logger.Info("[ThemeMaker] '{0}': skipped — movie shares its folder ({1}) with other " +
+                                 "items, so a theme there would collide/apply library-wide. Give the movie its own folder.",
+                                 u.Name, u.OutDir);
+                    continue;
+                }
+
+                kept.Add(u);
             }
 
-            return list;
+            kept = kept.OrderBy(u => u.Name, StringComparer.OrdinalIgnoreCase).ToList();
+            if (cfg.Limit > 0 && kept.Count > cfg.Limit)
+            {
+                kept = kept.Take(cfg.Limit).ToList();
+            }
+
+            return kept;
         }
 
         // Output folder for a movie: its own containing directory (standard Emby one-folder-per-movie
         // layout). backdrops/theme.mp4 and theme.mp3 land there, mirroring the series convention.
         private static string MovieDir(Movie movie)
             => Path.GetDirectoryName(movie.Path) ?? movie.Path;
+
+        // Normalize a directory for collision comparison (full path, no trailing separator).
+        private static string NormDir(string dir)
+        {
+            try { return Path.GetFullPath(dir).TrimEnd(Path.DirectorySeparatorChar); }
+            catch { return dir ?? string.Empty; }
+        }
 
         private List<BaseItem> GetEpisodes(Series series)
         {
@@ -307,10 +348,10 @@ namespace EmbyThemeMaker.Theme
                     name, cand.Season, cand.Number, cand.Start, cand.End, cand.Duration, reason, cand.LocalPath);
             }
 
-            return targets.Select(t => ProcessTarget(name, t, cand, reason, cfg, preview, ct)).ToList();
+            return targets.Select(t => ProcessTarget(name, unit.IsMovie, t, cand, reason, cfg, preview, ct)).ToList();
         }
 
-        private ThemeResult ProcessTarget(string name, Target t, Candidate cand, string reason,
+        private ThemeResult ProcessTarget(string name, bool isMovie, Target t, Candidate cand, string reason,
                                           ThemeMakerOptions cfg, bool preview, CancellationToken ct)
         {
             var prior = ExistingFor(t);
@@ -323,9 +364,13 @@ namespace EmbyThemeMaker.Theme
                 }
 
                 var tag = prior != null ? "HAS THEME" : "ready";
+                // Movies have no season/episode — only series get the SxxExx segment.
+                var src = isMovie
+                    ? string.Empty
+                    : string.Format("S{0}E{1} ", cand.Season, cand.Number);
                 var detail = string.Format(
-                    "{0} -> {1} : S{2}E{3} intro {4:0.0}-{5:0.0}s ({6:0.0}s, {7})",
-                    tag, t.OutPath, cand.Season, cand.Number, cand.Start, cand.End, cand.Duration, reason);
+                    "{0} -> {1} : {2}intro {3:0.0}-{4:0.0}s ({5:0.0}s, {6})",
+                    tag, t.OutPath, src, cand.Start, cand.End, cand.Duration, reason);
                 return ThemeResult.Make(name, ResultStatus.WouldCreate, detail, t.Kind);
             }
 
@@ -434,6 +479,7 @@ namespace EmbyThemeMaker.Theme
         {
             var candidates = new List<Candidate>();
             bool sawMarker = false;
+            double? outOfRangeDur = null; // a marked span that was rejected only for its length
 
             foreach (var item in sources)
             {
@@ -449,6 +495,7 @@ namespace EmbyThemeMaker.Theme
                 var dur = end - start;
                 if (dur < cfg.MinIntro || dur > cfg.MaxIntro)
                 {
+                    outOfRangeDur = dur; // remember one, for an actionable "no source" reason
                     continue;
                 }
 
@@ -463,7 +510,21 @@ namespace EmbyThemeMaker.Theme
 
             if (candidates.Count == 0)
             {
-                return (null, sawMarker ? "markers present but no usable/in-range source file" : "no intro markers");
+                if (!sawMarker)
+                {
+                    return (null, "no intro markers");
+                }
+
+                // Markers exist but nothing qualified. If a span was rejected purely for its length,
+                // say so with the number and the window — the common movie case (e.g. a 210s scene
+                // with Maximum intro length = 150), so the operator knows exactly what to change.
+                if (outOfRangeDur.HasValue)
+                {
+                    return (null, string.Format("intro {0:0.0}s outside [{1:0.#}, {2:0.#}]s — adjust Min/Max intro length",
+                        outOfRangeDur.Value, cfg.MinIntro, cfg.MaxIntro));
+                }
+
+                return (null, "markers present but the source file is missing/unreadable");
             }
 
             if (cfg.Prefer == SourcePref.First)
