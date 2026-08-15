@@ -58,7 +58,7 @@ namespace EmbyThemeMaker.Theme
         private string FfprobePath => _ffmpegManager?.FfmpegConfiguration?.ProbePath; // Emby's ffprobe
 
         /// <summary>Run the encode for one target. Returns null on success, or an error message.</summary>
-        public string Encode(Target target, string src, double start, double dur, ThemeMakerOptions cfg,
+        public string Encode(Target target, string src, bool redactStrmTarget, double start, double dur, ThemeMakerOptions cfg,
                              CancellationToken ct)
         {
             var ffmpeg = FfmpegPath;
@@ -75,10 +75,17 @@ namespace EmbyThemeMaker.Theme
                 Thread.CurrentThread.ManagedThreadId + ".tmp" + ext);
 
             var args = target.Kind == TargetKind.Audio
-                ? BuildAudioArgs(src, start, dur, tmp, target.OutName, cfg)
-                : BuildVideoArgs(src, start, dur, tmp, target.OutName, cfg);
+                ? BuildAudioArgs(src, redactStrmTarget, start, dur, tmp, target.OutName, cfg)
+                : BuildVideoArgs(src, redactStrmTarget, start, dur, tmp, target.OutName, cfg);
 
-            _logger.Debug("[ThemeMaker] ffmpeg ({0}) {1}", ffmpeg, string.Join(" ", args.Select(QuoteArg)));
+            if (redactStrmTarget)
+            {
+                _logger.Debug("[ThemeMaker] ffmpeg ({0}) STRM input redacted", ffmpeg);
+            }
+            else
+            {
+                _logger.Debug("[ThemeMaker] ffmpeg ({0}) {1}", ffmpeg, string.Join(" ", args.Select(QuoteArg)));
+            }
 
             int rc;
             string stderrTail;
@@ -95,7 +102,7 @@ namespace EmbyThemeMaker.Theme
             catch (Exception ex)
             {
                 SafeDelete(tmp);
-                return "ffmpeg spawn failed: " + ex.Message;
+                return "ffmpeg spawn failed: " + SafeError(ex.Message, redactStrmTarget, src);
             }
 
             if (timedOut)
@@ -107,7 +114,7 @@ namespace EmbyThemeMaker.Theme
             if (rc != 0)
             {
                 SafeDelete(tmp);
-                return "ffmpeg: " + stderrTail;
+                return "ffmpeg: " + SafeError(stderrTail, redactStrmTarget, src);
             }
 
             if (!File.Exists(tmp) || new FileInfo(tmp).Length == 0)
@@ -179,12 +186,12 @@ namespace EmbyThemeMaker.Theme
             return rate;
         }
 
-        private string AudioMap(string src, ThemeMakerOptions cfg)
+        private string AudioMap(string src, bool redactStrmTarget, ThemeMakerOptions cfg)
         {
             var amap = "0:a:0?";
             if (!string.IsNullOrWhiteSpace(cfg.AudioLang))
             {
-                var idx = ProbeAudioIndex(src, cfg.AudioLang);
+                var idx = ProbeAudioIndex(src, redactStrmTarget, cfg.AudioLang);
                 if (idx.HasValue)
                 {
                     amap = "0:a:" + idx.Value + "?";
@@ -194,14 +201,14 @@ namespace EmbyThemeMaker.Theme
                     // No stream tagged with the requested language — fall back to the first, but say
                     // so, since a wrong tag (e.g. "english"/"jp" instead of "eng"/"jpn") is silent otherwise.
                     _logger.Info("[ThemeMaker] no audio stream tagged '{0}' in {1}; using the first stream",
-                        cfg.AudioLang, src);
+                        cfg.AudioLang, redactStrmTarget ? StrmResolver.RedactedTarget : src);
                 }
             }
 
             return amap;
         }
 
-        private List<string> BuildVideoArgs(string src, double start, double dur, string outTmp,
+        private List<string> BuildVideoArgs(string src, bool redactStrmTarget, double start, double dur, string outTmp,
                                             string outName, ThemeMakerOptions cfg)
         {
             var (fin, fout, foutStart) = FadeArgs(dur, cfg);
@@ -223,7 +230,7 @@ namespace EmbyThemeMaker.Theme
             {
                 "-hide_banner", "-nostdin", "-y",
                 "-ss", start.ToString("0.000", ci), "-i", src, "-t", dur.ToString("0.000", ci),
-                "-map", "0:v:0", "-map", AudioMap(src, cfg),
+                "-map", "0:v:0", "-map", AudioMap(src, redactStrmTarget, cfg),
                 "-dn", "-map_chapters", "-1",
                 "-vf", vf,
                 "-af", af,
@@ -253,7 +260,7 @@ namespace EmbyThemeMaker.Theme
             return cmd;
         }
 
-        private List<string> BuildAudioArgs(string src, double start, double dur, string outTmp,
+        private List<string> BuildAudioArgs(string src, bool redactStrmTarget, double start, double dur, string outTmp,
                                             string outName, ThemeMakerOptions cfg)
         {
             var (fin, fout, foutStart) = FadeArgs(dur, cfg);
@@ -270,7 +277,7 @@ namespace EmbyThemeMaker.Theme
             {
                 "-hide_banner", "-nostdin", "-y",
                 "-ss", start.ToString("0.000", ci), "-i", src, "-t", dur.ToString("0.000", ci),
-                "-vn", "-dn", "-map", AudioMap(src, cfg),
+                "-vn", "-dn", "-map", AudioMap(src, redactStrmTarget, cfg),
                 "-map_chapters", "-1",
                 "-af", af,
                 "-c:a", acodec, "-b:a", cfg.AudioBitrate, "-ac", "2", "-ar", "48000",
@@ -364,7 +371,7 @@ namespace EmbyThemeMaker.Theme
         }
 
         /// <summary>Return the audio-relative index of the first stream tagged with the given language.</summary>
-        private int? ProbeAudioIndex(string path, string lang)
+        private int? ProbeAudioIndex(string path, bool redactStrmTarget, string lang)
         {
             var ffprobe = FfprobePath;
             if (string.IsNullOrEmpty(ffprobe) || !File.Exists(ffprobe))
@@ -405,7 +412,8 @@ namespace EmbyThemeMaker.Theme
                     {
                         try { proc.Kill(); } catch { /* best effort */ }
                         try { proc.WaitForExit(); } catch { /* already gone */ }
-                        _logger.Debug("[ThemeMaker] ffprobe audio-lang detect timed out for {0}", path);
+                        _logger.Debug("[ThemeMaker] ffprobe audio-lang detect timed out for {0}",
+                            redactStrmTarget ? StrmResolver.RedactedTarget : path);
                         return null;
                     }
 
@@ -416,7 +424,9 @@ namespace EmbyThemeMaker.Theme
             }
             catch (Exception ex)
             {
-                _logger.Debug("[ThemeMaker] ffprobe audio-lang detect failed for {0}: {1}", path, ex.Message);
+                _logger.Debug("[ThemeMaker] ffprobe audio-lang detect failed for {0}: {1}",
+                    redactStrmTarget ? StrmResolver.RedactedTarget : path,
+                    SafeError(ex.Message, redactStrmTarget, path));
                 return null;
             }
         }
@@ -465,6 +475,16 @@ namespace EmbyThemeMaker.Theme
                 rel++;
                 idx = braceStreams + 1;
             }
+        }
+
+        private static string SafeError(string message, bool redactStrmTarget, string strmTarget)
+        {
+            if (redactStrmTarget)
+            {
+                return "STRM input failed (details redacted)";
+            }
+
+            return message;
         }
 
         private static void SafeDelete(string p)

@@ -147,10 +147,15 @@ namespace EmbyThemeMaker.Config
         public CaptionItem ExecCaption { get; set; } = new CaptionItem("Execution");
 
         [DisplayName("Parallel encodes")]
-        [Description("How many ffmpeg encodes to run at once. Default 2.")]
+        [Description("How many ffmpeg encodes to run at once. Default 1. Keep this at 1 when Generate opens STRM media.")]
         [MinValue(1)]
         [MaxValue(16)]
-        public int Jobs { get; set; } = 2;
+        public int Jobs { get; set; } = 1;
+
+        [DisplayName("Maximum new themes per Generate run (0 = no limit)")]
+        [Description("Stop after this many series receive at least one newly created theme output. Existing outputs skipped by Generate do not count. Default 1.")]
+        [MinValue(0)]
+        public int MaxNewThemesPerRun { get; set; } = 1;
 
         [DisplayName("Scan library after generating")]
         [Description("Request one Emby library scan at the end so new theme files are registered (a per-item refresh does not pick up theme media).")]
