@@ -60,9 +60,9 @@ namespace EmbyThemeMaker.Theme
 
             _logger.Info("[ThemeMaker] ===== {0} run starting =====", preview ? "PREVIEW" : "GENERATE");
             _logger.Info("[ThemeMaker] settings: mode={0}, force={1}, prefer={2}, minIntro={3}s, maxIntro={4}s, " +
-                         "pad={5}/{6}s, audioLang={7}, jobs={8}, refreshAfter={9}{10}",
+                         "pad={5}/{6}s, audioLang={7}, jobs={8}, maxNewSidecars={9}, refreshAfter={10}{11}",
                 cfg.Mode, cfg.Force, cfg.Prefer, cfg.MinIntro, cfg.MaxIntro, cfg.PadStart, cfg.PadEnd,
-                audioLang, cfg.Jobs, cfg.RefreshAfter,
+                audioLang, cfg.Jobs, cfg.MaxNewThemesPerRun, cfg.RefreshAfter,
                 string.IsNullOrWhiteSpace(cfg.OnlyUnderPath) ? "" : ", onlyUnder=" + cfg.OnlyUnderPath);
             _logger.Info("[ThemeMaker] encode: maxHeight={0}, crf={1}, preset={2}, peakBitrate={3}, " +
                          "audioBitrate={4}, fadeIn={5}s, fadeOut={6}s",
@@ -89,7 +89,10 @@ namespace EmbyThemeMaker.Theme
                 return results;
             }
 
-            var jobs = preview ? 1 : Math.Max(1, cfg.Jobs);
+            // The new-theme cap counts series only after at least one final output exists. When a cap
+            // is active, serialize workers so an in-flight encode cannot overshoot it.
+            var generationLimiter = new SuccessfulGenerationLimiter(preview ? 0 : cfg.MaxNewThemesPerRun);
+            var jobs = preview || cfg.MaxNewThemesPerRun > 0 ? 1 : Math.Max(1, cfg.Jobs);
             var gate = new SemaphoreSlim(jobs);
             var tasks = new List<System.Threading.Tasks.Task>();
             var resultsLock = new object();
@@ -129,6 +132,12 @@ namespace EmbyThemeMaker.Theme
                 foreach (var u in units)
                 {
                     ct.ThrowIfCancellationRequested();
+                    if (!preview && !generationLimiter.CanGenerate)
+                    {
+                        _logger.Info("[ThemeMaker] successful new-theme limit reached ({0}); stopping Generate run", generationLimiter.SuccessfulGenerations);
+                        break;
+                    }
+
                     gate.Wait(ct);
                     var captured = u;
                     var unitTargets = TargetCountFor(cfg);
@@ -137,7 +146,7 @@ namespace EmbyThemeMaker.Theme
                         ReportEncode(0.5 * unitTargets); // this unit's targets started
                         try
                         {
-                            var r = ProcessUnit(captured, cfg, preview, ct);
+                            var r = ProcessUnit(captured, cfg, preview, ct, generationLimiter);
                             lock (resultsLock)
                             {
                                 results.AddRange(r);
@@ -336,7 +345,7 @@ namespace EmbyThemeMaker.Theme
         // Per-unit processing (series or movie)
         // ------------------------------------------------------------------ #
         private List<ThemeResult> ProcessUnit(WorkUnit unit, ThemeMakerOptions cfg, bool preview,
-                                              CancellationToken ct)
+                                              CancellationToken ct, SuccessfulGenerationLimiter generationLimiter)
         {
             var name = unit.Name;
             var targets = BuildTargets(unit.OutDir, cfg);
@@ -360,11 +369,35 @@ namespace EmbyThemeMaker.Theme
                     name, cand.Season, cand.Number, cand.Start, cand.End, cand.Duration, reason, cand.LocalPath);
             }
 
-            return targets.Select(t => ProcessTarget(name, unit.IsMovie, t, cand, reason, cfg, preview, ct)).ToList();
+            var unitResults = new List<ThemeResult>();
+            var needsGenerationSlot = !preview && cand != null &&
+                targets.Any(target => cfg.Force || ExistingFor(target) == null);
+            var hasGenerationSlot = !needsGenerationSlot || generationLimiter.TryBeginUnit();
+            var created = false;
+            try
+            {
+                foreach (var target in targets)
+                {
+                    var result = ProcessTarget(name, unit.IsMovie, target, cand, reason, cfg, preview, ct,
+                        hasGenerationSlot);
+                    unitResults.Add(result);
+                    created = created || result.Status == ResultStatus.Created;
+                }
+            }
+            finally
+            {
+                if (needsGenerationSlot && hasGenerationSlot)
+                {
+                    generationLimiter.CompleteUnit(created);
+                }
+            }
+
+            return unitResults;
         }
 
         private ThemeResult ProcessTarget(string name, bool isMovie, Target t, Candidate cand, string reason,
-                                          ThemeMakerOptions cfg, bool preview, CancellationToken ct)
+                                          ThemeMakerOptions cfg, bool preview, CancellationToken ct,
+                                          bool hasGenerationSlot)
         {
             var prior = ExistingFor(t);
 
@@ -398,6 +431,11 @@ namespace EmbyThemeMaker.Theme
                 return ThemeResult.Make(name, ResultStatus.NoSource, "no source (" + reason + ")", t.Kind);
             }
 
+            if (!hasGenerationSlot)
+            {
+                return ThemeResult.Make(name, ResultStatus.Skipped, "new-theme limit reached", t.Kind);
+            }
+
             var start = Math.Max(0.0, cand.Start - cfg.PadStart);
             var dur = (cand.End + cfg.PadEnd) - start;
 
@@ -411,8 +449,19 @@ namespace EmbyThemeMaker.Theme
                 return ThemeResult.Make(name, ResultStatus.Error, "mkdir failed: " + ex.Message, t.Kind);
             }
 
+            // Preview returned above. Generate is the only path that may read a STRM wrapper and
+            // it does so after marker, existing-output, cap, and destination eligibility checks.
+            var resolution = ThemeGenerationPolicy.ShouldResolveStrm(!preview)
+                ? StrmResolver.Resolve(cand.LocalPath, ct)
+                : StrmResolution.Success(cand.LocalPath, false);
+            if (!resolution.IsSuccess)
+            {
+                _logger.Warn("[ThemeMaker] '{0}' [{1}]: source skipped: {2}", name, t.Kind, resolution.ErrorCategory);
+                return ThemeResult.Make(name, ResultStatus.Error, resolution.ErrorCategory, t.Kind);
+            }
+
             _logger.Debug("[ThemeMaker] '{0}' [{1}]: encoding {2:0.0}s -> {3}", name, t.Kind, dur, t.OutPath);
-            var err = _ffmpeg.Encode(t, cand.LocalPath, start, dur, cfg, ct);
+            var err = _ffmpeg.Encode(t, resolution.Source, resolution.IsStrmTarget, start, dur, cfg, ct);
             if (err != null)
             {
                 _logger.Error("[ThemeMaker] '{0}' [{1}]: encode failed: {2}", name, t.Kind, err);

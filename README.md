@@ -47,10 +47,12 @@ No API key, no external ffmpeg — the plugin uses Emby's own item database and 
 
 Everything runs from **Dashboard → Scheduled Tasks**:
 
-- **Theme Maker: Preview (read-only)** — logs exactly what it *would* generate for each series
-  (source episode, intro span, whether a theme already exists) without writing anything. Run this
-  first.
-- **Theme Maker: Generate** — actually encodes the theme files, per your settings.
+- **Theme Maker: Preview (read-only)** - logs exactly what it *would* generate for each series
+  (source episode, intro span, whether a theme already exists) without writing anything or reading
+  STRM wrapper files. Run this first.
+- **Theme Maker: Generate** - actually encodes the theme files, per your settings. This is the only
+  Theme Maker task that reads a STRM wrapper, and it does so only after the episode markers and output
+  eligibility have been checked.
 
 Add a trigger to either (daily / interval / on startup) to run it on a schedule, or run on demand.
 All activity is logged to the Emby log with a `[ThemeMaker]` prefix.
@@ -70,8 +72,25 @@ All activity is logged to the Emby log with a `[ThemeMaker]` prefix.
 | **Max video height / CRF / Preset / Peak bitrate** | libx264 quality controls |
 | **Audio bitrate / Fade in / Fade out** | audio + fade controls |
 | **Output filenames / backdrop subfolder** | where and what to write |
-| **Parallel encodes** | how many ffmpeg jobs at once |
+| **Parallel encodes** | how many ffmpeg jobs at once (default 1; keep 1 for STRM Generate runs) |
+| **Maximum new themes per Generate run** | series allowed to receive one or both configured outputs before Generate stops (default 1; existing skipped outputs do not count) |
 | **Scan library after generating** | trigger one Emby scan at the end so new themes register |
+
+## STRM safety
+
+A `.strm` wrapper is not opened by Preview. During Generate, Theme Maker accepts a
+normal local media path unchanged. For a `.strm` file it reads at most 64 KiB as UTF-8 (an optional BOM
+is accepted), ignores blank lines and `#` comment lines, and requires exactly one absolute `http` or
+`https` URI. All other schemes, local paths, malformed targets, and multiple targets are skipped with
+a safe category. The target is passed directly to ffmpeg without a shell and is never written to Theme
+Maker logs, errors, or task summaries.
+
+### Migration notes
+
+After upgrading, run the read-only Theme Maker preview first. Existing `Jobs` values are retained, but
+new installations default to one job and one successful series per Generate run. Set a deliberate
+per-run series cap before scheduling Generate. Existing `theme.mp3` files remain protected unless
+Overwrite is enabled. Preview remains read-only and does not read STRM wrappers.
 
 Safe by default: it never overwrites an existing theme unless **Overwrite** is on, and it never
 deletes a song out of a curated `theme-music/` folder.
