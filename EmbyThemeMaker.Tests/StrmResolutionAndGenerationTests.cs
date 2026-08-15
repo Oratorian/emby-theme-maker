@@ -57,6 +57,17 @@ namespace EmbyThemeMaker.Tests
         }
 
         [Fact]
+        public void BoundedReaderNeverReadsPastLimitWhenLengthGrows()
+        {
+            using (var stream = new GrowingLengthStream(StrmResolver.MaximumBytes + 1))
+            {
+                Assert.ThrowsAny<Exception>(() => StrmResolver.ReadBounded(stream, CancellationToken.None));
+                Assert.Equal(StrmResolver.MaximumBytes, stream.BytesRead);
+                Assert.True(stream.MaximumRequestedCount <= 4096);
+            }
+        }
+
+        [Fact]
         public void ResolverRejectsInvalidUtf8()
         {
             var wrapper = Path.Combine(Path.GetTempPath(), "theme-maker-test-" + Guid.NewGuid().ToString("N") + ".strm");
@@ -172,6 +183,47 @@ namespace EmbyThemeMaker.Tests
             catch
             {
                 // Test cleanup is best effort.
+            }
+        }
+
+        private sealed class GrowingLengthStream : Stream
+        {
+            private readonly MemoryStream _inner;
+            private int _lengthReads;
+
+            public GrowingLengthStream(int length)
+            {
+                _inner = new MemoryStream(new byte[length], false);
+            }
+
+            public int BytesRead { get; private set; }
+            public int MaximumRequestedCount { get; private set; }
+            public override bool CanRead => true;
+            public override bool CanSeek => true;
+            public override bool CanWrite => false;
+            public override long Length => ++_lengthReads == 1 ? StrmResolver.MaximumBytes : _inner.Length;
+            public override long Position { get => _inner.Position; set => _inner.Position = value; }
+
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                MaximumRequestedCount = Math.Max(MaximumRequestedCount, count);
+                var read = _inner.Read(buffer, offset, count);
+                BytesRead += read;
+                return read;
+            }
+
+            public override long Seek(long offset, SeekOrigin origin) => _inner.Seek(offset, origin);
+            public override void SetLength(long value) => throw new NotSupportedException();
+            public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+            public override void Flush() { }
+
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing)
+                {
+                    _inner.Dispose();
+                }
+                base.Dispose(disposing);
             }
         }
     }

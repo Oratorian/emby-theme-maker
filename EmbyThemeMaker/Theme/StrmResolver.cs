@@ -127,31 +127,43 @@ namespace EmbyThemeMaker.Theme
 
         private static byte[] ReadBounded(string path, CancellationToken cancellationToken)
         {
-            var info = new FileInfo(path);
-            if (info.Length > MaximumBytes)
-            {
-                throw new WrapperTooLargeException();
-            }
-
             using (var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                return ReadBounded(input, cancellationToken);
+            }
+        }
+
+        internal static byte[] ReadBounded(Stream input, CancellationToken cancellationToken)
+        {
             using (var output = new MemoryStream())
             {
+                if (input.CanSeek && input.Length > MaximumBytes)
+                {
+                    throw new WrapperTooLargeException();
+                }
+
                 var buffer = new byte[4096];
                 int total = 0;
-                int read;
-                while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
+                while (total < MaximumBytes)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    total += read;
-                    if (total > MaximumBytes)
+                    var remaining = MaximumBytes - total;
+                    var read = input.Read(buffer, 0, Math.Min(buffer.Length, remaining));
+                    if (read == 0)
                     {
-                        throw new WrapperTooLargeException();
+                        break;
                     }
 
+                    total += read;
                     output.Write(buffer, 0, read);
                 }
 
                 cancellationToken.ThrowIfCancellationRequested();
+                if (input.CanSeek && input.Length > MaximumBytes)
+                {
+                    throw new WrapperTooLargeException();
+                }
+
                 return output.ToArray();
             }
         }
